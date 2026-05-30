@@ -44,7 +44,7 @@ def main():
         help="Model name for Method 2 (default: Qwen/Qwen2.5-0.5B-Instruct)"
     )
     parser.add_argument(
-        "--api-key", type=str, default="sk-32276abe79c74fff96cf2e3672e8f1ca",
+        "--api-key", type=str, default=None,
         help="DeepSeek API key for Method 1"
     )
     parser.add_argument(
