@@ -1,0 +1,9 @@
+# Local secrets
+playground/deepseek_api.env.sh
+
+# Python cache
+__pycache__/
+playground/__pycache__/
+*.pyc
+# expired scripts
+
