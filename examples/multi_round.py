@@ -14,11 +14,11 @@ TASK_PROMPT = (
 )
 
 SENSITIVE_FIELDS = {
-    "email": "zhangsan@example.com",
+    "email": "to:zhangsan@example.com, body:会议安排，明天下午在6C201，三点准时开会",
     "phone": "13800138000",
 }
 
 FIELD_DESCRIPTIONS = {
-    "email": "电子邮箱",
+    "email": "电子邮箱信息，包含收件人和邮件内容",
     "phone": "手机号码",
 }
