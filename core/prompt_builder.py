@@ -265,15 +265,27 @@ class PromptBuilder:
     # Method 2: Summary prompt (Phase 3)
     # ═══════════════════════════════════════════════════════════════════════
 
-    def build_summary_request(self) -> str:
+    def build_summary_request(self, revealed_fields: list[str] | None = None) -> str:
         """Build the prompt asking model to summarize without sensitive values.
 
-        Appended after splice-back in Phase 3 of Method 2.
+        The generated summary is the ONLY new text retained after Phase 3.
+        The all-masked prefix ensures the model CANNOT attend to real values.
+
+        Args:
+            revealed_fields: Optional list of field names that were revealed.
+                            If provided, the prompt explicitly forbids them.
         """
-        return (
-            "任务已完成。请用一段话简要总结你刚才做了什么操作"
-            "（不要使用任何具体数值，只说做了什么类型的操作即可）。"
+        base = (
+            "任务已完成。请用一段话简要总结你刚才完成了什么操作"
+            "（不要使用任何具体数值、密钥、密码、令牌、URL 或任何敏感信息，"
+            "只说完成了什么类型的操作即可，例如\"发送了邮件通知\"、\"发送了短信提醒\"）。"
         )
+        if revealed_fields:
+            field_list = "、".join(revealed_fields)
+            base += (
+                f" 特别禁止输出以下字段的任何真实值：{field_list}。"
+            )
+        return base
 
     # ═══════════════════════════════════════════════════════════════════════
     # Method 2: Full prompt assembly

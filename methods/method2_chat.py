@@ -132,6 +132,13 @@ class KVCacheChatBot:
         self._sensitive_gen_start: Optional[int] = None  # bookmark for Phase 3 removal
         self._user_task: str = ""
 
+        # Clean text tracking for Phase 3 prefill reconstruction.
+        # As the conversation progresses through Phase 0→1→2→3, we
+        # accumulate text pieces that are clean (no real values in them).
+        # When Phase 3 rebuilds the KV, these pieces are concatenated
+        # with the summary to produce a pristine prefill.
+        self._clean_text_parts: list[str] = []  # [base_prompt, phase1_output, hint, ...]
+
         # Conversation audit log: records all turns for quit-time display
         self._conv_log: list[dict] = []
 
@@ -156,6 +163,10 @@ class KVCacheChatBot:
         self.phase = ConversationPhase.NORMAL
         self._conv_log = []  # reset audit log
         self._conv_log.append({"role": "system", "phase": "init", "content": f"任务: {user_task}"})
+
+        # Seed clean text tracking with the all-masked base prompt
+        all_masked_prompt = self.variants.prompts[frozenset()]
+        self._clean_text_parts = [all_masked_prompt]
 
         # Pre-compute first-token logits from all_masked
         all_masked_prompt = self.variants.prompts[frozenset()]
@@ -292,7 +303,9 @@ class KVCacheChatBot:
         # Check for sensitive request
         req_fields = self._extract_requested_fields(parsed)
         if req_fields:
-            # Transition to REVEALING
+            # Transition to REVEALING.
+            # Record Phase 1 output as clean text before revealing.
+            self._clean_text_parts.append(gen_text)
             self.phase = ConversationPhase.REVEALING
             return self._handle_reveal_entry(req_fields)
 
@@ -357,6 +370,8 @@ class KVCacheChatBot:
         # within the same cycle, so the removal range covers everything).
         if self._sensitive_gen_start is None:
             self._sensitive_gen_start = self.current_position
+            # Record hint as clean text (it contains field names only, no real values)
+            self._clean_text_parts.append(hint_formatted)
 
         # Continue generation in REVEALING phase
         return self._run_state_machine()
@@ -453,12 +468,21 @@ class KVCacheChatBot:
         )
         print_system("Prefix 已恢复为全保密状态。")
 
-        # Step 3: Append summary request and generate summary
-        summary_request = self.prompt_builder.build_summary_request()
-        prev_pos = self.current_position
-        # Check if the last token in KV was <|im_end|> — if so, use wrap_user_turn
-        # which assumes <|im_end|> is already present
-        summary_formatted = self.prompt_builder.wrap_user_turn(summary_request)
+        # Save clean base snapshot BEFORE appending summary.
+        # We'll truncate back to this after generating the summary
+        # and re-prefill just the summary text for a pristine KV.
+        self.current_kv_snapshot = clone_cache(self.current_kv)
+        self.current_position_snapshot = self.current_position
+
+        # Step 3: Append summary request and generate summary.
+        # After remove_token_range, the last token is NOT <|im_end|> (it was
+        # chopped off at the hint boundary). Use wrap_user_turn_no_end which
+        # does not assume a preceding <|im_end|>.
+        revealed_snapshot = sorted(self._revealed_fields)
+        summary_request = self.prompt_builder.build_summary_request(
+            revealed_fields=revealed_snapshot
+        )
+        summary_formatted = self.prompt_builder.wrap_user_turn_no_end(summary_request)
 
         self._next_logits, self.current_kv, self.current_position = forward_tokens(
             self.model, self.tokenizer, summary_formatted,
@@ -476,15 +500,56 @@ class KVCacheChatBot:
         self._next_logits = None
         print(summary_text)
 
+        # ── Re-prefill summary onto a FRESH base KV ──────────────────
+        # The clean_base_kv snapshot contains the Phase 2 hint
+        # ("[系统提示: fields 已解密]") and old SENSITIVE_REQUEST output
+        # from Phase 1. These are misleading in the next conversation
+        # round: the hint says fields are "decrypted" but the prefix
+        # is now all-masked. The model gets confused and outputs CLEAR
+        # instead of properly requesting fields.
+        #
+        # Fix: use the pre-computed all_masked variant KV as the base
+        # (prefix + system + user_task). It has no stale hints/requests.
+        # Prefill just the summary onto it. O(1) — reuses the
+        # pre-computed variant.
+
+        clean_base_kv = clone_cache(self.variants.variants[frozenset()])
+        clean_base_pos = self.variants.prompt_len
+
+        # Wrap summary as assistant turn and prefill it
+        summary_wrapped = (
+            f"{summary_text}<|im_end|>\n"
+        )
+        summary_ids = self.tokenizer.encode(
+            summary_wrapped, return_tensors="pt"
+        ).to(self.device)
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=summary_ids,
+                past_key_values=clean_base_kv,
+                use_cache=True,
+            )
+        self.current_kv = clone_cache(outputs.past_key_values)
+        self.current_position = clean_base_pos + summary_ids.shape[1]
+
+        print_system(
+            f"摘要已通过 prefill 写入干净 KV（使用 all_masked 变体 base）。"
+            f"base_prompt_len={clean_base_pos}, "
+            f"summary_tokens={summary_ids.shape[1]}, "
+            f"final_pos={self.current_position}"
+        )
+
         # Log Phase 3 summary
         self._conv_log.append({
             "role": "assistant", "phase": "phase3",
             "content": summary_text,
-            "note": "摘要 (全保密前缀 — 敏感输出已从KV清除，此摘要由模型在掩码前缀下生成)",
+            "note": (
+                "摘要 (全保密前缀下生成 — 旧敏感输出已通过 remove_token_range 删除，"
+                "prefix 已 splice 回全保密，模型无法访问任何真实值)"
+            ),
         })
 
         # Step 4: Clean up and return to NORMAL
-        revealed_snapshot = sorted(self._revealed_fields)
         self._revealed_fields.clear()
         self._sensitive_gen_start = None
         self.phase = ConversationPhase.NORMAL

@@ -24,9 +24,9 @@ import importlib
 
 EXAMPLES = [
     "email_and_sms",
-    # "multi_round",                   # uncomment to enable
-    # "short_values_long_context",     # 短密文+长上下文
-    # "long_values",                   # 长密文(64字符密钥/JWT/长URL)
+    "multi_round",                   # uncomment to enable
+    "short_values_long_context",     # 短密文+长上下文
+    "long_values",                   # 长密文(64字符密钥/JWT/长URL)
 ]
 
 

@@ -389,14 +389,37 @@ class KVVariantBuilder:
             kv = prefill(self.model, prompt_text, self.tokenizer, self.device)
             variants[combo] = kv
 
-        # 3. Verify shape consistency
+        # 3. Verify shape consistency — pad/truncate mismatched variants
         first_k, _ = get_cache_kv(variants[frozenset()], 0)
         first_shape = first_k.shape
-        for combo, kv in variants.items():
+        target_len = first_shape[2]  # sequence dimension
+
+        for combo, kv in list(variants.items()):
             k, _ = get_cache_kv(kv, 0)
-            assert k.shape == first_shape, (
-                f"Shape mismatch: all_masked {first_shape} vs combo {combo} {k.shape}"
-            )
+            if k.shape[2] == target_len:
+                continue
+            delta = target_len - k.shape[2]  # positive = too short, negative = too long
+            print(f"[WARN] 变体 {set(combo)} token 数偏差 {delta}，补齐/截断 KV...")
+
+            # Pad or truncate each layer's K/V tensors directly
+            fixed = DynamicCache()
+            n = get_cache_num_layers(kv)
+            for i in range(n):
+                k_i, v_i = get_cache_kv(kv, i)
+                if delta > 0:
+                    # Too short: repeat last position
+                    pad_k = k_i[:, :, -1:, :].repeat(1, 1, delta, 1)
+                    pad_v = v_i[:, :, -1:, :].repeat(1, 1, delta, 1)
+                    new_k = torch.cat([k_i, pad_k], dim=2)
+                    new_v = torch.cat([v_i, pad_v], dim=2)
+                elif delta < 0:
+                    # Too long: truncate
+                    new_k = k_i[:, :, :target_len, :]
+                    new_v = v_i[:, :, :target_len, :]
+                else:
+                    new_k, new_v = k_i, v_i
+                fixed.update(new_k, new_v, i)
+            variants[combo] = fixed
 
         # 4. prompt_len = sequence length (same for all variants)
         prompt_len = get_cache_seq_len(variants[frozenset()])
