@@ -85,7 +85,10 @@ class Method3InjectBot:
         self.current_position: int = 0
         self._next_logits = None
         self._revealed_fields: set[str] = set()
+        self.clean_position: int = 0  # last clean position (before injection)
         self._inject_start_pos: Optional[int] = None
+        self._sensitive_segment_kv = None
+        self._sensitive_segment_start: Optional[int] = None
         self._user_task: str = ""
 
         # Conversation log for audit
@@ -180,6 +183,7 @@ class Method3InjectBot:
                     "role": "assistant", "phase": "request",
                     "content": gen_text,
                 })
+                self.clean_position = self.current_position  # mark clean text boundary
                 return self._handle_inject(req_fields)
 
             # 2. Check for clear signal (after injection + task generation)
@@ -245,37 +249,41 @@ class Method3InjectBot:
         return self._run_protocol()
 
     def _do_clearing_phase(self) -> str:
-        """Phase 3: remove_token_range + summary + length-preserving pad.
+        """Phase 3: Save sensitive segment, generate summary from clean
+        context, pad to original length.
 
-        1. Record original KV length.
-        2. Delete contaminated range [inject_start, current).
-        3. Generate summary from the truncated KV.
-        4. Pad summary to restore original length.
+        Instead of remove_token_range (destructive), the sensitive KV
+        segment is saved for potential future switch-back.
         """
-        print_header("阶段 3：KV 清除 + 摘要 + Padding")
+        print_header("阶段 3：保存敏感段 + 摘要 + 长度对齐")
 
         original_len = self.current_position
-        inject_start = self._inject_start_pos or 0
-        removed = original_len - inject_start
 
-        print_info(
-            f"移除污染 tokens [{inject_start}, {original_len}) "
-            f"({removed} tokens)"
-        )
-        self.current_kv = remove_token_range(
-            self.current_kv, inject_start, original_len
-        )
-        self.current_position = inject_start
+        # Save sensitive segment (don't delete)
+        if self.clean_position > 0 and self.clean_position < self.current_position:
+            saved_len = self.current_position - self.clean_position
+            self._sensitive_segment_kv = clone_cache(self.current_kv)
+            self._sensitive_segment_start = self.clean_position
+            print_info(
+                f"保存敏感 KV 段 [{self.clean_position}, "
+                f"{self.current_position}) ({saved_len} tokens)"
+            )
+
+            # Delete polluted suffix: remove everything after clean_position
+            # (injections, model output with real values — model never sees them)
+            self.current_kv = remove_token_range(
+                self.current_kv, self.clean_position, self.current_position
+            )
+            self.current_position = self.clean_position
+
         self._inject_start_pos = None
 
-        # Generate summary from truncated clean KV
+        # Generate summary from clean context (no real values visible)
         revealed_snapshot = sorted(self._revealed_fields)
         summary_request = self.prompt_builder.build_summary_request(
             revealed_fields=revealed_snapshot
         )
-        summary_formatted = self.prompt_builder.wrap_user_turn_no_end(
-            summary_request
-        )
+        summary_formatted = self.prompt_builder.wrap_user_turn_no_end(summary_request)
 
         self._next_logits, self.current_kv, self.current_position = (
             forward_tokens(
@@ -297,22 +305,14 @@ class Method3InjectBot:
         self._next_logits = None
         print(summary_text)
 
-        # ── Length-preserving pad ───────────────────────────────────
+        # Length-preserving pad
         pad_needed = original_len - self.current_position
         if pad_needed > 0:
-            print_info(
-                f"Padding {pad_needed} tokens 恢复原始长度 ({original_len})"
-            )
+            print_info(f"Padding {pad_needed} tokens 对齐原始长度 ({original_len})")
             pad_text = "\n" * pad_needed
-            pad_ids = self.tokenizer.encode(
-                pad_text, return_tensors="pt"
-            ).to(self.device)
-            # If pad_text produced wrong token count, adjust
+            pad_ids = self.tokenizer.encode(pad_text, return_tensors="pt").to(self.device)
             if pad_ids.shape[1] != pad_needed:
-                # Fallback: pad with spaces
-                pad_ids = self.tokenizer.encode(
-                    " " * pad_needed, return_tensors="pt"
-                ).to(self.device)
+                pad_ids = self.tokenizer.encode(" " * pad_needed, return_tensors="pt").to(self.device)
             actual_pad = min(pad_ids.shape[1], pad_needed)
             pad_ids = pad_ids[:, :actual_pad]
             with torch.no_grad():
@@ -325,7 +325,7 @@ class Method3InjectBot:
             self.current_position += actual_pad
             print_system(
                 f"Padding 完成。final_pos={self.current_position} "
-                f"(目标={original_len}, 实际pad={actual_pad})"
+                f"(original={original_len}, pad={actual_pad})"
             )
 
         # Log
@@ -333,15 +333,15 @@ class Method3InjectBot:
             "role": "assistant", "phase": "summary",
             "content": summary_text,
             "note": (
-                f"摘要 (已删除 {removed} tokens 污染内容，"
-                f"padding 补回至 {original_len})"
+                f"摘要 (干净上下文生成 + 长度对齐 padding。"
+                f"敏感段 {saved_len} tokens 已保存，可切换回)"
             ),
         })
 
         # Reset
         self._revealed_fields.clear()
         print_system(
-            f"敏感信息已从 KV-cache 清除（字段: {', '.join(revealed_snapshot)}）。"
+            f"敏感信息已清除（字段: {', '.join(revealed_snapshot)}）。"
             f"可以开始新任务。"
         )
 

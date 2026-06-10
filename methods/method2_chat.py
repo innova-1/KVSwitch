@@ -130,8 +130,10 @@ class KVCacheChatBot:
         self._next_logits = None  # logits for next token generation
         self._revealed_fields: set[str] = set()
         self._sensitive_gen_start: Optional[int] = None  # bookmark for Phase 3 removal
+        self._sensitive_segment_kv = None  # saved sensitive KV segment
+        self._sensitive_segment_start: Optional[int] = None
         self._user_task: str = ""
-
+        self.clean_position:int = 0 #last position of clean text in current_kv,write in Normal phase,read in clearing phase
         # Clean text tracking for Phase 3 prefill reconstruction.
         # As the conversation progresses through Phase 0→1→2→3, we
         # accumulate text pieces that are clean (no real values in them).
@@ -306,6 +308,7 @@ class KVCacheChatBot:
             # Transition to REVEALING.
             # Record Phase 1 output as clean text before revealing.
             self._clean_text_parts.append(gen_text)
+            self.clean_position = self.current_position  # mark clean text boundary
             self.phase = ConversationPhase.REVEALING
             return self._handle_reveal_entry(req_fields)
 
@@ -432,34 +435,30 @@ class KVCacheChatBot:
         return self._run_state_machine()
 
     def _do_clearing_phase(self) -> str:
-        """Phase 3: Remove sensitive output, splice back all-masked prefix,
-        generate summary, return to NORMAL.
+        """Phase 3: Save sensitive segment, splice back prefix, generate summary
+        from clean context, pad to original length.
 
-        Steps:
-          1. remove_token_range: delete sensitive generation tokens from KV.
-          2. splice_prefix: restore all-masked prefix.
-          3. Append summary request → generate clean summary.
-          4. Reset tracking state → NORMAL.
+        Instead of remove_token_range (destructive), we save the sensitive
+        KV segment for potential future switch-back. The summary is generated
+        from the clean portion of the KV (all-masked prefix + clean suffix).
         """
-        print_header("阶段 3：清除敏感输出 + 生成摘要")
+        print_header("阶段 3：保存敏感段 + 生成摘要 + 长度对齐")
 
-        # Step 1: Remove sensitive output tokens
+        revealed_snapshot = sorted(self._revealed_fields)
+        original_len = self.current_position
+
+        # Step 1: Save sensitive KV segment (don't delete — save for switch-back)
         if (
             self._sensitive_gen_start is not None
             and self._sensitive_gen_start < self.current_position
         ):
-            removed_count = self.current_position - self._sensitive_gen_start
+            saved_len = self.current_position - self._sensitive_gen_start
+            self._sensitive_segment_kv = clone_cache(self.current_kv)
+            self._sensitive_segment_start = self._sensitive_gen_start
             print_info(
-                f"移除敏感输出 tokens [{self._sensitive_gen_start}, "
-                f"{self.current_position}) ({removed_count} tokens)"
+                f"保存敏感 KV 段 [{self._sensitive_gen_start}, "
+                f"{self.current_position}) ({saved_len} tokens)"
             )
-            self.current_kv = remove_token_range(
-                self.current_kv,
-                self._sensitive_gen_start,
-                self.current_position,
-            )
-            self.current_position = self._sensitive_gen_start
-            self._sensitive_gen_start = None
 
         # Step 2: Splice back all-masked prefix
         all_masked = self.variants.variants[frozenset()]
@@ -468,17 +467,25 @@ class KVCacheChatBot:
         )
         print_system("Prefix 已恢复为全保密状态。")
 
-        # Save clean base snapshot BEFORE appending summary.
-        # We'll truncate back to this after generating the summary
-        # and re-prefill just the summary text for a pristine KV.
-        self.current_kv_snapshot = clone_cache(self.current_kv)
-        self.current_position_snapshot = self.current_position
+        # Delete suffix polluted KV: remove everything after clean_position
+        # (hints, sensitive output, etc.). Only the clean prefix + Phase 1
+        # request text remains. Model sees no completed task — summary must
+        # be predictive.
+        if self.clean_position > 0 and self.clean_position < self.current_position:
+            removed = self.current_position - self.clean_position
+            print_info(
+                f"删除污染后缀 tokens [{self.clean_position}, "
+                f"{self.current_position}) ({removed} tokens)"
+            )
+            self.current_kv = remove_token_range(
+                self.current_kv, self.clean_position, self.current_position
+            )
+            self.current_position = self.clean_position
 
-        # Step 3: Append summary request and generate summary.
-        # After remove_token_range, the last token is NOT <|im_end|> (it was
-        # chopped off at the hint boundary). Use wrap_user_turn_no_end which
-        # does not assume a preceding <|im_end|>.
-        revealed_snapshot = sorted(self._revealed_fields)
+        # Step 3: Generate summary from clean context
+        # Model only sees: all_masked prefix + system protocol + user task +
+        # Phase 1 SENSITIVE_REQUEST output. It does NOT see the completed
+        # task output or hints — so summary must be predictive.
         summary_request = self.prompt_builder.build_summary_request(
             revealed_fields=revealed_snapshot
         )
@@ -500,29 +507,28 @@ class KVCacheChatBot:
         self._next_logits = None
         print(summary_text)
 
-        # ── Re-prefill summary onto a FRESH base KV ──────────────────
-        # The clean_base_kv snapshot contains the Phase 2 hint
-        # ("[系统提示: fields 已解密]") and old SENSITIVE_REQUEST output
-        # from Phase 1. These are misleading in the next conversation
-        # round: the hint says fields are "decrypted" but the prefix
-        # is now all-masked. The model gets confused and outputs CLEAR
-        # instead of properly requesting fields.
-        #
-        # Fix: use the pre-computed all_masked variant KV as the base
-        # (prefix + system + user_task). It has no stale hints/requests.
-        # Prefill just the summary onto it. O(1) — reuses the
-        # pre-computed variant.
+        # Step 4: Pad to original length for position encoding consistency
+        pad_needed = original_len - self.current_position
+        if pad_needed > 0:
+            print_info(f"Padding {pad_needed} tokens 对齐原始长度 ({original_len})")
+            pad_text = "\n" * pad_needed
+            pad_ids = self.tokenizer.encode(pad_text, return_tensors="pt").to(self.device)
+            actual_pad = min(pad_ids.shape[1], pad_needed)
+            pad_ids = pad_ids[:, :actual_pad]
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=pad_ids,
+                    past_key_values=self.current_kv,
+                    use_cache=True,
+                )
+            self.current_kv = clone_cache(outputs.past_key_values)
+            self.current_position += actual_pad
 
+        # Step 5: Re-prefill summary onto fresh all_masked base for pristine next-round KV
         clean_base_kv = clone_cache(self.variants.variants[frozenset()])
         clean_base_pos = self.variants.prompt_len
-
-        # Wrap summary as assistant turn and prefill it
-        summary_wrapped = (
-            f"{summary_text}<|im_end|>\n"
-        )
-        summary_ids = self.tokenizer.encode(
-            summary_wrapped, return_tensors="pt"
-        ).to(self.device)
+        summary_wrapped = f"{summary_text}<|im_end|>\n"
+        summary_ids = self.tokenizer.encode(summary_wrapped, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model(
                 input_ids=summary_ids,
@@ -533,29 +539,27 @@ class KVCacheChatBot:
         self.current_position = clean_base_pos + summary_ids.shape[1]
 
         print_system(
-            f"摘要已通过 prefill 写入干净 KV（使用 all_masked 变体 base）。"
-            f"base_prompt_len={clean_base_pos}, "
-            f"summary_tokens={summary_ids.shape[1]}, "
-            f"final_pos={self.current_position}"
+            f"摘要已从干净上下文生成并 prefill。"
+            f"original_len={original_len}, final_pos={self.current_position}"
         )
 
-        # Log Phase 3 summary
+        # Log
         self._conv_log.append({
             "role": "assistant", "phase": "phase3",
             "content": summary_text,
             "note": (
-                "摘要 (全保密前缀下生成 — 旧敏感输出已通过 remove_token_range 删除，"
-                "prefix 已 splice 回全保密，模型无法访问任何真实值)"
+                "摘要 (干净上下文生成 + 长度对齐 padding。"
+                "敏感段已保存，可切换回。prefix 全保密)"
             ),
         })
 
-        # Step 4: Clean up and return to NORMAL
+        # Reset → NORMAL
         self._revealed_fields.clear()
         self._sensitive_gen_start = None
         self.phase = ConversationPhase.NORMAL
 
         print_system(
-            f"敏感信息已从 KV-cache 清除（字段: {', '.join(revealed_snapshot)}）。"
+            f"敏感信息已清除（字段: {', '.join(revealed_snapshot)}）。"
             f"可以开始新任务。"
         )
 
